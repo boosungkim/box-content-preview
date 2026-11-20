@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import TimeControlsV2 from '../TimeControlsV2';
 import SliderControl from '../../slider/SliderControl';
@@ -271,6 +271,95 @@ describe('TimeControlsV2', () => {
             const style = scrubber?.getAttribute('style') ?? '';
             expect(style).toContain('--bp-track-mask');
             expect(style).toContain('linear-gradient');
+        });
+    });
+
+    describe('scrub preview', () => {
+        const getSliderProps = (): React.ComponentProps<typeof SliderControl> =>
+            (SliderControl as unknown as jest.Mock).mock.calls.at(-1)[0];
+
+        test('should preview drag times and seek only once on release', () => {
+            const onScrubPreview = jest.fn();
+            const onTimeChange = jest.fn();
+            render(
+                <TimeControlsV2
+                    currentTime={5}
+                    durationTime={100}
+                    onScrubPreview={onScrubPreview}
+                    onTimeChange={onTimeChange}
+                />,
+            );
+
+            act(() => {
+                getSliderProps().onScrubStart?.();
+                getSliderProps().onUpdate?.(20);
+            });
+            act(() => getSliderProps().onUpdate?.(40));
+
+            expect(onScrubPreview).toHaveBeenCalledTimes(1);
+            expect(onScrubPreview).toHaveBeenCalledWith(40);
+            expect(onTimeChange).not.toHaveBeenCalled();
+            expect(getSliderProps().value).toBe(40);
+
+            act(() => getSliderProps().onScrubEnd?.());
+
+            expect(onTimeChange).toHaveBeenCalledTimes(1);
+            expect(onTimeChange).toHaveBeenCalledWith(40);
+            expect(getSliderProps().value).toBe(5);
+        });
+
+        test('should hide the hover filmstrip while dragging', () => {
+            render(
+                <TimeControlsV2
+                    durationTime={100}
+                    filmstripInterval={1}
+                    onScrubPreview={jest.fn()}
+                    onTimeChange={jest.fn()}
+                />,
+            );
+
+            act(() => getSliderProps().onMouseOver?.({} as React.MouseEvent<HTMLDivElement>));
+            expect(screen.getByTestId('bp-FilmstripV2')).toHaveClass('bp-is-shown');
+
+            act(() => {
+                getSliderProps().onScrubStart?.();
+                getSliderProps().onUpdate?.(20);
+            });
+            expect(screen.getByTestId('bp-FilmstripV2')).not.toHaveClass('bp-is-shown');
+
+            act(() => getSliderProps().onScrubEnd?.());
+            expect(screen.getByTestId('bp-FilmstripV2')).toHaveClass('bp-is-shown');
+        });
+
+        test('should seek a plain click without a drag preview', () => {
+            const onScrubPreview = jest.fn();
+            const onTimeChange = jest.fn();
+            render(<TimeControlsV2 durationTime={100} onScrubPreview={onScrubPreview} onTimeChange={onTimeChange} />);
+
+            act(() => {
+                getSliderProps().onScrubStart?.();
+                getSliderProps().onUpdate?.(70);
+            });
+            expect(getSliderProps().value).toBe(70);
+
+            act(() => getSliderProps().onScrubEnd?.());
+
+            expect(onScrubPreview).not.toHaveBeenCalled();
+            expect(onTimeChange).toHaveBeenCalledWith(70);
+        });
+
+        test('should seek on every update without onScrubPreview', () => {
+            const onTimeChange = jest.fn();
+            render(<TimeControlsV2 durationTime={100} onTimeChange={onTimeChange} />);
+
+            act(() => {
+                getSliderProps().onScrubStart?.();
+                getSliderProps().onUpdate?.(20);
+                getSliderProps().onUpdate?.(40);
+                getSliderProps().onScrubEnd?.();
+            });
+
+            expect(onTimeChange.mock.calls).toEqual([[20], [40]]);
         });
     });
 });

@@ -93,6 +93,7 @@ export default function VideoControlsV2({
     onPlayNextChange,
     onQualityChange,
     onRateChange,
+    onScrubPreview,
     onSubtitleChange,
     onSubtitlesToggle,
     onTimeChange,
@@ -192,6 +193,7 @@ export default function VideoControlsV2({
                     fps={fps}
                     isBlueprintEnabled={isBlueprintEnabled}
                     onCommentMarkerClick={onCommentMarkerClick}
+                    onScrubPreview={onScrubPreview}
                     onTimeChange={onTimeChange}
                 />
                 <div className="bp-VideoControlsV2-bar">

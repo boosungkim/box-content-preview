@@ -52,6 +52,11 @@ class Video360Viewer extends DashViewer {
         return false;
     }
 
+    /** The video is drawn onto a sphere, so a flat filmstrip frame can't stand in for it */
+    canShowScrubPreview() {
+        return false;
+    }
+
     /** @inheritdoc */
     isVideoControlsV2Enabled() {
         return (

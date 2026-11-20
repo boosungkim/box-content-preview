@@ -1,0 +1,40 @@
+.bp-ScrubPreviewRoot {
+    pointer-events: none;
+    position: absolute;
+    z-index: 1; // Covers the frozen video frame while a preview is shown
+}
+
+// The preview replaces the buffering spinner as the loading state
+.bp-is-scrub-previewing {
+    .bp-media-buffering-spinner,
+    .bp-MediaLoadingIndicator {
+        visibility: hidden;
+    }
+}
+
+.bp-ScrubPreview {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    background-color: #000;
+    background-repeat: no-repeat;
+    transition: opacity 150ms ease-out;
+
+    &::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        background-color: rgb(0 0 0 / 35%);
+        transition: opacity 80ms ease-out;
+    }
+
+    &.bp-is-visible {
+        opacity: 1;
+        transition: none;
+    }
+
+    &.bp-is-dimmed::after {
+        opacity: 1;
+    }
+}

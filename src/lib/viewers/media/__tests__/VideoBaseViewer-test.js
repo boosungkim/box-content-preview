@@ -2229,6 +2229,7 @@ describe('lib/viewers/media/VideoBaseViewer', () => {
         beforeEach(() => {
             videoBase.mediaEl = {
                 currentTime: 0,
+                duration: 100,
                 pause: jest.fn(),
                 removeEventListener: jest.fn(),
             };

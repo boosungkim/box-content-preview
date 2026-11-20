@@ -386,6 +386,15 @@ describe('lib/viewers/box3d/video360/Video360Viewer', () => {
         });
     });
 
+    describe('canShowScrubPreview()', () => {
+        test('should never show the flat scrub preview over the sphere', () => {
+            jest.spyOn(viewer, 'featureEnabled').mockReturnValue(true);
+            jest.spyOn(viewer, 'isVideoControlsV2Enabled').mockReturnValue(true);
+
+            expect(viewer.canShowScrubPreview()).toBe(false);
+        });
+    });
+
     describe('isVideoControlsV2Enabled()', () => {
         test.each`
             useReactControls | isV2FlagOn | isBlueprintOn | expected

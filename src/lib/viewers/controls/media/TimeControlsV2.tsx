@@ -24,6 +24,8 @@ export type Props = {
     fps?: number;
     isBlueprintEnabled?: boolean;
     onCommentMarkerClick?: (marker: CommentMarker) => void;
+    /** When provided, dragging the scrubber previews times here and seeks only once on release */
+    onScrubPreview?: (time: number) => void;
     onTimeChange: (volume: number) => void;
 };
 
@@ -38,6 +40,7 @@ export default function TimeControlsV2({
     fps,
     isBlueprintEnabled = false,
     onCommentMarkerClick,
+    onScrubPreview,
     onTimeChange,
 }: Props): JSX.Element {
     const [isSliderHovered, setIsSliderHovered] = React.useState(false);
@@ -45,6 +48,9 @@ export default function TimeControlsV2({
     const [hoverPositionMax, setHoverPositionMax] = React.useState(0);
     const [hoverTime, setHoverTime] = React.useState(0);
     const [trackWidth, setTrackWidth] = React.useState(0);
+    const [scrubTime, setScrubTime] = React.useState<number | null>(null);
+    const isScrubbingRef = React.useRef(false);
+    const scrubTimeRef = React.useRef<number | null>(null);
     const scrubberRef = React.useRef<HTMLDivElement>(null);
     const selectedMarker = React.useMemo(
         () => commentMarkers.find(marker => marker.isSelected) ?? null,
@@ -55,7 +61,8 @@ export default function TimeControlsV2({
         hostSelectedId,
         selectedMarker?.selectionSeq ?? null,
     );
-    const currentValue = isFinite(currentTime) ? currentTime : 0;
+    const playbackValue = isFinite(currentTime) ? currentTime : 0;
+    const currentValue = scrubTime ?? playbackValue;
     const durationValue = isFinite(durationTime) ? durationTime : 0;
     const currentPercentage = percent(currentValue, durationValue);
     const bufferedAmount = bufferedRange && bufferedRange.length ? bufferedRange.end(bufferedRange.length - 1) : 0;
@@ -118,6 +125,39 @@ export default function TimeControlsV2({
         setHoverTime(newTime);
     };
 
+    const handleScrubStart = React.useCallback((): void => {
+        isScrubbingRef.current = !!onScrubPreview;
+    }, [onScrubPreview]);
+
+    const handleScrubEnd = React.useCallback((): void => {
+        if (!isScrubbingRef.current) return;
+
+        const finalTime = scrubTimeRef.current;
+        isScrubbingRef.current = false;
+        scrubTimeRef.current = null;
+        setScrubTime(null);
+        if (finalTime !== null) {
+            onTimeChange(finalTime);
+        }
+    }, [onTimeChange]);
+
+    const handleUpdate = React.useCallback(
+        (newTime: number): void => {
+            if (isScrubbingRef.current && onScrubPreview) {
+                // The press itself only moves the thumb, so a plain click goes straight to the seek preview
+                const isPress = scrubTimeRef.current === null;
+                scrubTimeRef.current = newTime;
+                setScrubTime(newTime);
+                if (!isPress) {
+                    onScrubPreview(newTime);
+                }
+                return;
+            }
+            onTimeChange(newTime);
+        },
+        [onScrubPreview, onTimeChange],
+    );
+
     return (
         <div
             ref={containerRef}
@@ -131,7 +171,7 @@ export default function TimeControlsV2({
                     imageUrl={filmstripUrl}
                     interval={filmstripInterval}
                     isBlueprintEnabled={isBlueprintEnabled}
-                    isShown={isSliderHovered}
+                    isShown={isSliderHovered && scrubTime === null}
                     position={hoverPosition}
                     positionMax={hoverPositionMax}
                     time={hoverTime}
@@ -152,7 +192,9 @@ export default function TimeControlsV2({
                     onMouseOut={(): void => setIsSliderHovered(false)}
                     onMouseOver={(): void => setIsSliderHovered(true)}
                     onMove={handleMouseMove}
-                    onUpdate={onTimeChange}
+                    onScrubEnd={handleScrubEnd}
+                    onScrubStart={handleScrubStart}
+                    onUpdate={handleUpdate}
                     step={fps ? 1 / fps : 5}
                     title={__('media_time_slider')}
                     track={`linear-gradient(to right, ${GrayWhite} calc(${currentPercentage}% - 2.5px), transparent calc(${currentPercentage}% - 2.5px), transparent calc(${currentPercentage}% + 2.5px), ${bufferedColor} calc(${currentPercentage}% + 2.5px), ${bufferedColor} ${bufferedPercentage}%, ${unplayedColor} ${bufferedPercentage}%, ${unplayedColor} 100%)`}

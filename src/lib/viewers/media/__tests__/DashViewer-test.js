@@ -3,6 +3,7 @@ import { setImmediate as flushImmediate } from 'timers';
 import noop from 'lodash/noop';
 import Api from '../../../api';
 import DashViewer from '../DashViewer';
+import MediaBaseViewer from '../MediaBaseViewer';
 import VideoBaseViewer from '../VideoBaseViewer';
 import BaseViewer from '../../BaseViewer';
 import PreviewError from '../../../PreviewError';
@@ -957,6 +958,223 @@ describe('lib/viewers/media/DashViewer', () => {
             await flushPromises();
 
             expect(stubs.renderUI).toBeCalled();
+        });
+    });
+
+    describe('scrub preview', () => {
+        let listeners;
+        let frameCallbacks;
+        const fire = event => [...(listeners[event] || [])].forEach(listener => listener());
+
+        beforeEach(() => {
+            jest.useFakeTimers();
+            listeners = {};
+            frameCallbacks = [];
+            dash.filmstripUrl = 'blob:filmstrip';
+            dash.filmstripHeight = 90;
+            dash.filmstripInterval = 1;
+            dash.mediaEl = {
+                addEventListener: jest.fn((event, listener) => {
+                    listeners[event] = [...(listeners[event] || []), listener];
+                }),
+                buffered: { length: 1, start: () => 0, end: () => 30 },
+                duration: 100,
+                pause: jest.fn(() => {
+                    dash.mediaEl.paused = true;
+                }),
+                paused: true,
+                readyState: HTMLMediaElement.HAVE_CURRENT_DATA,
+                removeEventListener: jest.fn((event, listener) => {
+                    listeners[event] = (listeners[event] || []).filter(l => l !== listener);
+                }),
+                requestVideoFrameCallback: jest.fn(callback => frameCallbacks.push(callback)),
+                seeking: false,
+            };
+            jest.spyOn(dash, 'featureEnabled').mockImplementation(feature => feature === 'videoScrubPreview.enabled');
+            jest.spyOn(dash, 'useReactControls').mockReturnValue(true);
+            jest.spyOn(dash, 'isVideoControlsV2Enabled').mockReturnValue(true);
+            jest.spyOn(dash, 'renderScrubPreview').mockImplementation();
+            jest.spyOn(dash, 'play').mockResolvedValue();
+            jest.spyOn(MediaBaseViewer.prototype, 'setMediaTime').mockImplementation(() => {
+                dash.mediaEl.seeking = true;
+            });
+        });
+
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        describe('seeking', () => {
+            test('should seek without a preview until the filmstrip has decoded', () => {
+                dash.filmstripHeight = 0;
+                dash.setMediaTime(80);
+
+                expect(dash.scrubPreview.isVisible).toBe(false);
+                expect(MediaBaseViewer.prototype.setMediaTime).toHaveBeenCalledWith(80);
+            });
+
+            test('should seek without a preview when the feature is disabled', () => {
+                dash.featureEnabled.mockReturnValue(false);
+                dash.setMediaTime(80);
+
+                expect(dash.scrubPreview.isVisible).toBe(false);
+            });
+
+            test('should skip the preview for buffered targets such as frame steps', () => {
+                dash.setMediaTime(10.04);
+
+                expect(dash.scrubPreview.isVisible).toBe(false);
+                expect(MediaBaseViewer.prototype.setMediaTime).toHaveBeenCalledWith(10.04);
+            });
+
+            test('should cover an unbuffered seek, dimmed, until the seeked frame is presented', () => {
+                dash.setMediaTime(80);
+                expect(dash.scrubPreview).toMatchObject({ isDimmed: true, isVisible: true, time: 80 });
+
+                dash.mediaEl.seeking = false;
+                fire('seeked');
+                expect(dash.scrubPreview.isVisible).toBe(true);
+
+                frameCallbacks[0]();
+                expect(dash.scrubPreview.isVisible).toBe(false);
+            });
+
+            test('should keep covering a playing video until it can continue past the seek', () => {
+                dash.mediaEl.paused = false;
+                dash.setMediaTime(80);
+
+                dash.mediaEl.seeking = false;
+                fire('seeked');
+                expect(frameCallbacks).toHaveLength(0);
+
+                dash.mediaEl.readyState = HTMLMediaElement.HAVE_FUTURE_DATA;
+                fire('canplay');
+                frameCallbacks[0]();
+                expect(dash.scrubPreview.isVisible).toBe(false);
+            });
+
+            test('should fall back to a short delay without frame callbacks', () => {
+                delete dash.mediaEl.requestVideoFrameCallback;
+                dash.setMediaTime(80);
+
+                dash.mediaEl.seeking = false;
+                fire('seeked');
+                expect(dash.scrubPreview.isVisible).toBe(true);
+
+                jest.advanceTimersByTime(250);
+                expect(dash.scrubPreview.isVisible).toBe(false);
+            });
+
+            test('should bring the spinner back when the seek is slow', () => {
+                dash.setMediaTime(80);
+                jest.advanceTimersByTime(1499);
+                expect(dash.scrubPreview.isSlow).toBe(false);
+
+                jest.advanceTimersByTime(1);
+                expect(dash.scrubPreview).toMatchObject({ isSlow: true, isVisible: true });
+            });
+
+            test('should not let a superseded seek hide a newer drag preview', () => {
+                dash.setMediaTime(80);
+                dash.mediaEl.seeking = false;
+                fire('seeked');
+
+                dash.handleScrubPreview(90);
+                frameCallbacks[0]();
+                fire('seeked');
+                jest.runAllTimers();
+
+                expect(dash.scrubPreview).toMatchObject({ isDimmed: false, isSlow: false, isVisible: true, time: 90 });
+            });
+
+            test('should stop waiting on destroy', () => {
+                dash.setMediaTime(80);
+                dash.destroy();
+
+                expect(listeners.seeked).toHaveLength(0);
+            });
+        });
+
+        describe('dragging', () => {
+            test('should pause playback, preview undimmed, and not seek', () => {
+                dash.mediaEl.paused = false;
+                dash.handleScrubPreview(42);
+                dash.handleScrubPreview(43);
+
+                expect(dash.mediaEl.pause).toHaveBeenCalledTimes(1);
+                expect(dash.scrubPreview).toMatchObject({ isDimmed: false, isVisible: true, time: 43 });
+                expect(MediaBaseViewer.prototype.setMediaTime).not.toHaveBeenCalled();
+            });
+
+            test('should seek once on release, keeping the preview even when buffered, and resume', () => {
+                dash.mediaEl.paused = false;
+                dash.handleScrubPreview(10);
+                dash.handleTimeupdateFromMediaControls(10);
+
+                expect(MediaBaseViewer.prototype.setMediaTime).toHaveBeenCalledWith(10);
+                expect(dash.scrubPreview).toMatchObject({ isDimmed: true, isVisible: true, time: 10 });
+                expect(dash.play).toHaveBeenCalled();
+                expect(dash.isScrubDragging).toBe(false);
+            });
+
+            test('should not resume a video that was paused before the drag', () => {
+                dash.handleScrubPreview(42);
+                dash.handleTimeupdateFromMediaControls(42);
+
+                expect(dash.mediaEl.pause).not.toHaveBeenCalled();
+                expect(dash.play).not.toHaveBeenCalled();
+            });
+        });
+
+        describe('loadScrubPreviewImage()', () => {
+            let image;
+
+            beforeEach(() => {
+                image = {};
+                jest.spyOn(window, 'Image').mockImplementation(() => image);
+                jest.spyOn(dash, 'renderUI').mockImplementation();
+            });
+
+            test('should record the decoded filmstrip height and re-render', () => {
+                dash.filmstripHeight = 0;
+                dash.loadScrubPreviewImage('blob:filmstrip');
+                image.naturalHeight = 270;
+                image.onload();
+
+                expect(image.src).toBe('blob:filmstrip');
+                expect(dash.filmstripHeight).toBe(270);
+                expect(dash.renderUI).toHaveBeenCalled();
+            });
+
+            test('should not decode the filmstrip when the feature is disabled', () => {
+                dash.featureEnabled.mockReturnValue(false);
+                dash.loadScrubPreviewImage('blob:filmstrip');
+
+                expect(window.Image).not.toHaveBeenCalled();
+            });
+        });
+
+        test('should render over the letterboxed picture and hide the spinner until a seek is slow', () => {
+            dash.renderScrubPreview.mockRestore();
+            dash.mediaContainerEl = document.createElement('div');
+            const video = document.createElement('video');
+            Object.defineProperties(video, {
+                clientHeight: { value: 1000 },
+                clientWidth: { value: 1000 },
+                videoHeight: { value: 1080 },
+                videoWidth: { value: 1920 },
+            });
+            dash.mediaContainerEl.appendChild(video);
+            dash.mediaEl = video;
+
+            dash.handleScrubPreview(10);
+            const root = dash.mediaContainerEl.querySelector('.bp-ScrubPreviewRoot');
+            expect(root).toHaveStyle({ height: '562.5px', left: '0px', top: '218.75px', width: '1000px' });
+            expect(dash.mediaContainerEl).toHaveClass('bp-is-scrub-previewing');
+
+            dash.scrubPreview = { ...dash.scrubPreview, isSlow: true };
+            dash.renderScrubPreview();
+            expect(dash.mediaContainerEl).not.toHaveClass('bp-is-scrub-previewing');
         });
     });
 

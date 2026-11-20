@@ -1,4 +1,5 @@
 import React from 'react';
+import noop from 'lodash/noop';
 import { createRoot } from 'react-dom/client';
 import {
     AI_TRANSCRIPTION_FOR_VIDEO_SUBTITLES,
@@ -19,6 +20,7 @@ import { Guide } from '../controls/media/MediaSettingsMenuGuides';
 import VideoControls from './VideoControls';
 import VideoControlsV2 from './VideoControlsV2';
 import VideoGuidesOverlay from '../controls/media/VideoGuidesOverlay';
+import ScrubPreview from '../controls/media/ScrubPreview';
 import VideoBaseViewer from './VideoBaseViewer';
 
 const CSS_CLASS_DASH = 'bp-media-dash';
@@ -26,6 +28,11 @@ const CSS_CLASS_HD = 'bp-media-controls-is-hd';
 const SEGMENT_SIZE = 5;
 const MAX_BUFFER = SEGMENT_SIZE * 12; // 60 sec
 const MANIFEST = 'manifest.mpd';
+// Upper bound on how long the scrub preview lingers once settled when no frame callback arrives
+const SCRUB_PREVIEW_PAINT_FALLBACK_MS = 250;
+const SCRUB_PREVIEW_SPINNER_DELAY_MS = 1500;
+const CSS_CLASS_SCRUB_PREVIEWING = 'bp-is-scrub-previewing';
+const VIDEO_SCRUB_PREVIEW_ENABLED = 'videoScrubPreview.enabled';
 const DEFAULT_VIDEO_WIDTH_PX = 854;
 const DEFAULT_VIDEO_HEIGHT_PX = 480;
 const SHAKA_CODE_ERROR_RECOVERABLE = 1;
@@ -48,6 +55,21 @@ class DashViewer extends VideoBaseViewer {
 
     /** @property {string} - URL for the filmstrip image */
     filmstripUrl;
+
+    /** @property {Function} - Cancels the pending hide of the current scrub preview */
+    cancelScrubPreviewHide = noop;
+
+    /** @property {number} - Natural height of the decoded filmstrip image, 0 until it decodes */
+    filmstripHeight = 0;
+
+    /** @property {boolean} - Whether the user is dragging the scrubber with the scrub preview showing */
+    isScrubDragging = false;
+
+    /** @property {Object} - Low-res filmstrip frame shown over the video while scrubbing or seeking */
+    scrubPreview = { isDimmed: false, isSlow: false, isVisible: false, time: null };
+
+    /** @property {boolean} - Whether playback resumes when the scrubber is released */
+    shouldResumeAfterScrub = false;
 
     /** @property {string} - ID of the selected audio track */
     selectedAudioTrack;
@@ -153,6 +175,15 @@ class DashViewer extends VideoBaseViewer {
         if (this.guidesRoot) {
             this.guidesRoot.unmount();
             this.guidesRoot = undefined;
+        }
+        this.cancelScrubPreviewHide();
+        if (this.scrubPreviewRoot) {
+            this.scrubPreviewRoot.unmount();
+            this.scrubPreviewRoot = undefined;
+        }
+        if (this.scrubPreviewEl && this.scrubPreviewEl.parentNode) {
+            this.scrubPreviewEl.parentNode.removeChild(this.scrubPreviewEl);
+            this.scrubPreviewEl = undefined;
         }
         if (this.guidesEl && this.guidesEl.parentNode) {
             this.guidesEl.parentNode.removeChild(this.guidesEl);
@@ -971,6 +1002,7 @@ class DashViewer extends VideoBaseViewer {
                         return;
                     }
                     this.filmstripUrl = filmstripUrl;
+                    this.loadScrubPreviewImage(filmstripUrl);
                     if (useReactControls) {
                         this.renderUI();
                     } else {
@@ -988,6 +1020,253 @@ class DashViewer extends VideoBaseViewer {
                     console.warn('Filmstrip load failed', err); // eslint-disable-line no-console
                 });
         }
+    }
+
+    /**
+     * Decodes the filmstrip once so the scrub preview only turns on when it can actually draw a frame
+     *
+     * @private
+     * @param {string} url - blob: URL for the filmstrip image
+     * @return {void}
+     */
+    loadScrubPreviewImage(url) {
+        if (!this.featureEnabled(VIDEO_SCRUB_PREVIEW_ENABLED)) {
+            return;
+        }
+
+        const image = new Image();
+        image.onload = () => {
+            if (this.destroyed || url !== this.filmstripUrl) {
+                return;
+            }
+            this.filmstripHeight = image.naturalHeight;
+            this.renderUI();
+        };
+        image.src = url;
+    }
+
+    /**
+     * Whether a decoded filmstrip can stand in for the video while scrubbing and seeking. Only the V2 React
+     * controls report drag previews, so the overlay is limited to them.
+     *
+     * @protected
+     * @return {boolean}
+     */
+    canShowScrubPreview() {
+        return (
+            this.featureEnabled(VIDEO_SCRUB_PREVIEW_ENABLED) &&
+            this.filmstripHeight > 0 &&
+            this.filmstripInterval > 0 &&
+            !!this.mediaEl &&
+            this.useReactControls() &&
+            this.isVideoControlsV2Enabled()
+        );
+    }
+
+    /**
+     * Shows the filmstrip frame for a time the user is dragging through. Playback pauses for the drag and the
+     * video is only seeked on release.
+     *
+     * @param {number} time - Time in seconds under the pointer
+     * @return {void}
+     */
+    handleScrubPreview = time => {
+        if (!this.isScrubDragging) {
+            this.isScrubDragging = true;
+            // Keeps the play button overlay hidden while playback is paused for the drag
+            this.isScrubbing = true;
+            this.shouldResumeAfterScrub = !this.mediaEl.paused;
+            if (this.shouldResumeAfterScrub) {
+                this.mediaEl.pause();
+            }
+        }
+
+        this.showScrubPreview(time, false);
+    };
+
+    /**
+     * Ends a drag once its release seek is issued, resuming playback if the drag paused it
+     *
+     * @override
+     * @param {number} time - Time in seconds
+     * @return {void}
+     */
+    handleTimeupdateFromMediaControls(time) {
+        super.handleTimeupdateFromMediaControls(time);
+
+        if (!this.isScrubDragging) {
+            return;
+        }
+
+        this.isScrubDragging = false;
+        this.isScrubbing = false;
+        if (this.shouldResumeAfterScrub) {
+            this.shouldResumeAfterScrub = false;
+            this.play().catch(noop);
+        }
+    }
+
+    /**
+     * Covers the stale frame with the target's filmstrip frame until the video can take over. Every seek path
+     * (scrubber, keyboard, comment markers, ranges) lands here.
+     *
+     * @override
+     * @param {number} time - Time in seconds
+     * @return {void}
+     */
+    setMediaTime(time) {
+        // Buffered targets (including frame steps) paint almost immediately, so a low-res frame would only flicker
+        if (!this.canShowScrubPreview() || (!this.scrubPreview.isVisible && this.isTimeBuffered(time))) {
+            super.setMediaTime(time);
+            return;
+        }
+
+        this.showScrubPreview(time, true);
+        super.setMediaTime(time);
+
+        if (this.mediaEl.seeking) {
+            this.hideScrubPreviewWhenSettled();
+        } else {
+            this.hideScrubPreview();
+        }
+    }
+
+    /**
+     * @private
+     * @param {number} time - Time in seconds
+     * @return {boolean} whether the time falls inside a buffered range
+     */
+    isTimeBuffered(time) {
+        const { buffered } = this.mediaEl;
+        for (let i = 0; i < buffered.length; i += 1) {
+            if (time >= buffered.start(i) && time <= buffered.end(i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the video can take over from the scrub preview: the seek is done and, when playing, playback can
+     * continue without immediately stalling on the next segment.
+     *
+     * @private
+     * @return {boolean}
+     */
+    isSeekSettled() {
+        const { paused, readyState, seeking } = this.mediaEl;
+        return !seeking && (paused || readyState >= HTMLMediaElement.HAVE_FUTURE_DATA);
+    }
+
+    /**
+     * @private
+     * @param {number} time - Time in seconds
+     * @param {boolean} isDimmed - Dims the frame while the real frame is loading
+     * @return {void}
+     */
+    showScrubPreview(time, isDimmed) {
+        this.cancelScrubPreviewHide();
+        this.scrubPreview = { isDimmed, isSlow: false, isVisible: true, time };
+        this.renderScrubPreview();
+    }
+
+    /**
+     * @private
+     * @return {void}
+     */
+    hideScrubPreview() {
+        this.cancelScrubPreviewHide();
+        if (!this.scrubPreview.isVisible) {
+            return;
+        }
+
+        this.scrubPreview = { ...this.scrubPreview, isVisible: false };
+        this.renderScrubPreview();
+    }
+
+    /**
+     * Fades the scrub preview once the seek settles and the seeked frame is on screen. A seek that is still
+     * loading after a while brings the spinner back over the dimmed frame.
+     *
+     * @private
+     * @return {void}
+     */
+    hideScrubPreviewWhenSettled() {
+        const { mediaEl } = this;
+        const events = ['canplay', 'pause', 'playing', 'seeked'];
+        let isActive = true;
+        let hideTimeoutId;
+
+        const hide = () => isActive && this.hideScrubPreview();
+        const hideWhenSettled = () => {
+            if (!this.isSeekSettled()) {
+                return;
+            }
+            // `seeked` can fire before the frame reaches the screen, so wait for it to be presented
+            clearTimeout(hideTimeoutId);
+            hideTimeoutId = setTimeout(hide, SCRUB_PREVIEW_PAINT_FALLBACK_MS);
+            if (typeof mediaEl.requestVideoFrameCallback === 'function') {
+                mediaEl.requestVideoFrameCallback(hide);
+            }
+        };
+        const slowTimeoutId = setTimeout(() => {
+            this.scrubPreview = { ...this.scrubPreview, isSlow: true };
+            this.renderScrubPreview();
+        }, SCRUB_PREVIEW_SPINNER_DELAY_MS);
+
+        events.forEach(event => mediaEl.addEventListener(event, hideWhenSettled));
+        this.cancelScrubPreviewHide = () => {
+            isActive = false;
+            clearTimeout(hideTimeoutId);
+            clearTimeout(slowTimeoutId);
+            events.forEach(event => mediaEl.removeEventListener(event, hideWhenSettled));
+            this.cancelScrubPreviewHide = noop;
+        };
+    }
+
+    /**
+     * Renders the scrub preview over the picture inside the video element
+     *
+     * @private
+     * @return {void}
+     */
+    renderScrubPreview() {
+        if (!this.canShowScrubPreview() || !this.mediaContainerEl) {
+            return;
+        }
+
+        if (!this.scrubPreviewEl) {
+            this.scrubPreviewEl = document.createElement('div');
+            this.scrubPreviewEl.className = 'bp-ScrubPreviewRoot';
+            this.mediaContainerEl.insertBefore(this.scrubPreviewEl, this.mediaEl.nextSibling);
+            this.scrubPreviewRoot = createRoot(this.scrubPreviewEl);
+        }
+
+        const { isDimmed, isSlow, isVisible, time } = this.scrubPreview;
+        this.mediaContainerEl.classList.toggle(CSS_CLASS_SCRUB_PREVIEWING, isVisible && !isSlow);
+
+        // Match the letterboxed picture rather than the element box so the frame isn't stretched
+        const { clientHeight, clientWidth, offsetLeft, offsetTop, videoHeight, videoWidth } = this.mediaEl;
+        const hasVideoSize = videoWidth > 0 && videoHeight > 0;
+        const width = hasVideoSize ? Math.min(clientWidth, (clientHeight * videoWidth) / videoHeight) : clientWidth;
+        const height = hasVideoSize ? (width * videoHeight) / videoWidth : clientHeight;
+        Object.assign(this.scrubPreviewEl.style, {
+            height: `${height}px`,
+            left: `${offsetLeft + (clientWidth - width) / 2}px`,
+            top: `${offsetTop + (clientHeight - height) / 2}px`,
+            width: `${width}px`,
+        });
+
+        this.scrubPreviewRoot.render(
+            <ScrubPreview
+                imageHeight={this.filmstripHeight}
+                imageUrl={this.filmstripUrl}
+                interval={this.filmstripInterval}
+                isDimmed={isDimmed}
+                isVisible={isVisible}
+                time={time}
+            />,
+        );
     }
 
     /**
@@ -1361,7 +1640,7 @@ class DashViewer extends VideoBaseViewer {
             isAutoGeneratedSubtitles: !!this.autoCaptionDisplayer,
             isHDSupported: this.hdVideoId !== -1,
             isNarrowVideo: this.isNarrowVideo,
-            isPlaying: !this.mediaEl.paused,
+            isPlaying: !this.mediaEl.paused || this.shouldResumeAfterScrub,
             mediaEl: this.mediaEl,
             movePlayback: this.movePlayback,
             onAnnotationColorChange: this.handleAnnotationColorChange,
@@ -1392,10 +1671,12 @@ class DashViewer extends VideoBaseViewer {
         }
 
         if (this.isVideoControlsV2Enabled()) {
+            this.renderScrubPreview();
             this.controls.render(
                 <VideoControlsV2
                     commentMarkers={this.commentMarkers}
                     onCommentMarkerClick={this.handleCommentMarkerClick}
+                    onScrubPreview={this.canShowScrubPreview() ? this.handleScrubPreview : undefined}
                     {...sharedProps}
                     {...this.getVideoControlsV2Props()}
                     onPlayNextChange={this.setPlayNext}
